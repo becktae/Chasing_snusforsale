@@ -1,5 +1,6 @@
 .env
 last_status.json
+tracker.log
 __pycache__/
 *.pyc
 .venv/

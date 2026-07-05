@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""배송 추적 알림 에이전트: PostNord(해외 구간) + EMS(국내 구간) 통합 조회 후 텔레그램 발송.
+"""배송 추적 알림 에이전트: EMS행방조회 API(해외 발송~국내 도착 전 구간 커버) 조회 후 텔레그램 발송.
 
-주의: PostNord/EMS 실제 응답 필드명이 문서와 다를 수 있음.
-첫 실행에서 이벤트가 비어 있으면 로그에 남는 raw 응답을 확인하고
-fetch_postnord()/fetch_ems() 의 필드 매핑을 조정할 것.
+EMS는 만국우편연합(UPU) 국제 네트워크라 국내 우정사업본부 API만으로
+발송국 출고 시점부터의 이벤트가 함께 조회된다. 위치 코드(nowLc)가
+"KR"로 시작하지 않으면 해외 구간으로 간주해 아이콘을 구분한다.
 """
 import json
 import logging
@@ -23,7 +23,6 @@ logger = logging.getLogger("tracker")
 
 STATE_FILE = Path(__file__).parent / "last_status.json"
 
-POSTNORD_URL = "https://api2.postnord.com/rest/shipment/v2/trackandtrace/findByIdentifier.json"
 EMS_URL = (
     "http://openapi.epost.go.kr/trace/retrieveLongitudinalEMSService/"
     "retrieveLongitudinalEMSService/getLongitudinalEMSList"
@@ -32,7 +31,7 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
 
 def normalize_time(raw: str) -> str:
-    """PostNord(ISO8601)/EMS(다양한 포맷) 시각 문자열을 'YYYY-MM-DD HH:MM' 으로 정규화."""
+    """EMS 응답의 다양한 시각 포맷을 'YYYY-MM-DD HH:MM' 으로 정규화."""
     if not raw:
         return ""
     raw = raw.strip()
@@ -47,53 +46,6 @@ def normalize_time(raw: str) -> str:
             continue
     logger.warning("알 수 없는 시각 포맷, 원본 유지: %s", raw)
     return raw
-
-
-def fetch_postnord(tracking_number: str, api_key: str) -> list[dict]:
-    """PostNord Track & Trace API 조회 (해외 구간). 실패 시 빈 리스트 반환."""
-    events: list[dict] = []
-    try:
-        resp = requests.get(
-            POSTNORD_URL,
-            params={"id": tracking_number, "locale": "en", "apikey": api_key},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        logger.error("PostNord 조회 실패 (%s): %s", tracking_number, e)
-        return events
-    except ValueError as e:
-        logger.error("PostNord 응답 JSON 파싱 실패 (%s): %s", tracking_number, e)
-        return events
-
-    try:
-        shipments = data.get("TrackingInformationResponse", {}).get("shipments") or []
-        for shipment in shipments:
-            for item in shipment.get("items") or []:
-                for ev in item.get("events") or []:
-                    location = ev.get("location")
-                    if isinstance(location, dict):
-                        location = location.get("displayName", "")
-                    events.append({
-                        "time": normalize_time(ev.get("eventTime", "")),
-                        "status": ev.get("status", ""),
-                        "description": ev.get("eventDescription") or ev.get("description", ""),
-                        "location": location or "",
-                        "leg": "intl",
-                    })
-    except (AttributeError, TypeError) as e:
-        logger.error(
-            "PostNord 응답 구조가 예상과 다릅니다 (%s): %s / raw=%s",
-            tracking_number, e, json.dumps(data, ensure_ascii=False)[:500],
-        )
-
-    if not events:
-        logger.warning(
-            "PostNord: %s 이벤트 없음. 실제 응답 구조 확인 필요: %s",
-            tracking_number, json.dumps(data, ensure_ascii=False)[:500],
-        )
-    return events
 
 
 def fetch_ems(tracking_number: str, service_key: str) -> list[dict]:
@@ -137,12 +89,13 @@ def fetch_ems(tracking_number: str, service_key: str) -> list[dict]:
 
     for row in rows:
         raw_time = find_text(row, "processDe")
+        location = find_text(row, "nowLc")
         events.append({
             "time": normalize_time(raw_time),
             "status": find_text(row, "processSttus"),
             "description": find_text(row, "detailDc"),
-            "location": find_text(row, "nowLc"),
-            "leg": "domestic",
+            "location": location,
+            "leg": "domestic" if location.upper().startswith("KR") else "intl",
         })
 
     if not events:
@@ -153,8 +106,8 @@ def fetch_ems(tracking_number: str, service_key: str) -> list[dict]:
     return events
 
 
-def collect_events(tracking_number: str, postnord_key: str, ems_key: str) -> list[dict]:
-    events = fetch_postnord(tracking_number, postnord_key) + fetch_ems(tracking_number, ems_key)
+def collect_events(tracking_number: str, ems_key: str) -> list[dict]:
+    events = fetch_ems(tracking_number, ems_key)
     events.sort(key=lambda e: e["time"])
     return events
 
@@ -209,7 +162,6 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 
 
 def main() -> None:
-    postnord_key = os.environ.get("POSTNORD_API_KEY", "")
     ems_key = os.environ.get("EMS_SERVICE_KEY", "")
     telegram_token = os.environ.get("TELEGRAM_TOKEN", "")
     telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -228,7 +180,7 @@ def main() -> None:
 
     for tn in tracking_numbers:
         try:
-            current_events = collect_events(tn, postnord_key, ems_key)
+            current_events = collect_events(tn, ems_key)
         except Exception:
             logger.exception("운송장 %s 처리 중 예외 발생", tn)
             current_events = []
