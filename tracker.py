@@ -40,7 +40,7 @@ def normalize_time(raw: str) -> str:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
     except ValueError:
         pass
-    for fmt in ("%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S", "%Y%m%d"):
+    for fmt in ("%Y-%m-%d %H:%M", "%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S", "%Y%m%d"):
         try:
             return datetime.strptime(raw, fmt).strftime("%Y-%m-%d %H:%M")
         except ValueError:
@@ -116,7 +116,17 @@ def fetch_ems(tracking_number: str, service_key: str) -> list[dict]:
         logger.error("EMS 응답 XML 파싱 실패 (%s): %s / raw=%s", tracking_number, e, resp.text[:500])
         return events
 
-    rows = root.findall(".//item") or root.findall(".//cmsLongitudinalEMSDVO") or root.findall(".//trackList")
+    header = root.find("cmmMsgHeader")
+    if header is not None and (header.findtext("successYN") or "") != "Y":
+        logger.error(
+            "EMS 응답 실패 (%s): returnCode=%s errMsg=%s",
+            tracking_number,
+            header.findtext("returnCode"),
+            header.findtext("errMsg"),
+        )
+        return events
+
+    rows = root.findall(".//longitudinalEMSList")
 
     def find_text(row, *tags):
         for tag in tags:
@@ -126,12 +136,12 @@ def fetch_ems(tracking_number: str, service_key: str) -> list[dict]:
         return ""
 
     for row in rows:
-        raw_time = find_text(row, "processDate", "trackingDate", "regDate", "applDate")
+        raw_time = find_text(row, "processDe")
         events.append({
             "time": normalize_time(raw_time),
-            "status": find_text(row, "processStatus", "trackingKindDetail", "kindDetail"),
-            "description": find_text(row, "processDetail", "detail", "kindDetail"),
-            "location": find_text(row, "processLocation", "location", "officeName"),
+            "status": find_text(row, "processSttus"),
+            "description": find_text(row, "detailDc"),
+            "location": find_text(row, "nowLc"),
             "leg": "domestic",
         })
 
